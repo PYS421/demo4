@@ -1,0 +1,16 @@
+{
+  "samples_total": 500,
+  "samples_with_response": 500,
+  "api_errors": 0,
+  "format_valid_samples": 405,
+  "format_valid_rate": 0.81,
+  "TP": 1690,
+  "FP": 957,
+  "FN": 2923,
+  "precision": 0.6384586324140537,
+  "recall": 0.36635595057446346,
+  "f1": 0.465564738292011,
+  "strategy": "T1",
+  "shots": 2,
+  "model": "qwen2.5:7b-instruct-q4_K_M"
+}

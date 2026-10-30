@@ -1,0 +1,42 @@
+# API credentials
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Logs
+*.log
+ollama.log
+
+# Model weights and caches
+*.safetensors
+*.bin
+*.gguf
+*.pt
+*.pth
+*.ckpt
+.cache/
+hf_cache/
+models/
+
+# Virtual environments
+venv/
+.venv/
+env/
+conda/
+
+# Backup files
+*.bak
+*.bak.*
+*.backup
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
