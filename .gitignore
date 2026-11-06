@@ -40,3 +40,18 @@ conda/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Raw BC5CDR corpus: do not upload original dataset files
+data/*
+!data/processed/
+
+# Keep only the two official experiment result directories
+outputs/*
+!outputs/experiment1_500/
+!outputs/experiment2_500_rerun/
+
+# Temporary notebooks and Python backups
+.ipynb_checkpoints/
+*.bak
+*.bak.*
+*.backup

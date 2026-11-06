@@ -30,35 +30,49 @@ def read_jsonl(path):
         return [json.loads(line) for line in f if line.strip()]
 
 
+
+def normalize_entity_type(value):
+    """将实体类型规范化为 Chemical 或 Disease。"""
+    if isinstance(value, list):
+        if len(value) != 1:
+            return None
+        value = value[0]
+
+    if not isinstance(value, str):
+        return None
+
+    value = value.strip()
+    return value if value in VALID_TYPES else None
+
+
 def normalize_entities(items):
-    """保留实体文本原样，按 (entity, type) 去重。"""
+    """保留合法实体，按 (entity, type) 去重。"""
     result = set()
+
     if not isinstance(items, list):
         return result
 
     for item in items:
         if not isinstance(item, dict):
             continue
+
         name = item.get("entity")
-        typ = item.get("type")
-        if (
-            isinstance(name, str)
-            and name.strip()
-            and typ in VALID_TYPES
-        ):
+        typ = normalize_entity_type(item.get("type"))
+
+        if isinstance(name, str) and name.strip() and typ is not None:
             result.add((name.strip(), typ))
+
     return result
 
 
 def parse_response(content, original_text):
-    """解析 JSON；标准解析失败时尝试修复，并严格校验输出。"""
+    """解析模型响应；单个实体类型错误不影响其他合法实体。"""
     raw = (content or "").strip()
 
-    # 兼容模型偶尔返回 Markdown 代码围栏的情况
-    raw = re.sub(r"^```(?:json)?\\s*", "", raw, flags=re.I)
-    raw = re.sub(r"\\s*```$", "", raw)
+    # 清理 Markdown JSON 代码围栏
+    raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.I)
+    raw = re.sub(r"\s*```$", "", raw)
 
-    # 先尝试标准 JSON 解析，仅在失败时调用 json_repair
     try:
         obj = json.loads(raw)
     except (json.JSONDecodeError, TypeError):
@@ -66,46 +80,60 @@ def parse_response(content, original_text):
             from json_repair import repair_json
             obj = repair_json(raw, return_objects=True)
         except Exception:
-            return None, False, "invalid_json"
-
-        # 修复结果必须是字典，且包含预期字段
-        if not isinstance(obj, dict):
-            return obj, False, "repair_not_object"
+            return None, False, "invalid_json", 0
 
     if not isinstance(obj, dict):
-        return obj, False, "not_object"
+        return obj, False, "not_object", 0
 
     if set(obj.keys()) != {"entities"}:
-        return obj, False, "wrong_top_level_keys"
+        return obj, False, "wrong_top_level_keys", 0
 
     entities = obj.get("entities")
     if not isinstance(entities, list):
-        return obj, False, "entities_not_list"
+        return obj, False, "entities_not_list", 0
+
+    valid_entities = []
+    type_errors = 0
 
     for item in entities:
         if not isinstance(item, dict):
-            return obj, False, "entity_not_object"
-        if set(item.keys()) != {"entity", "type"}:
-            return obj, False, "wrong_entity_keys"
-        if not isinstance(item.get("entity"), str) or not item["entity"].strip():
-            return obj, False, "empty_entity"
-        if item.get("type") not in VALID_TYPES:
-            return obj, False, "invalid_entity_type"
-        if item["entity"] not in original_text:
-            return obj, False, "entity_not_in_text"
+            return obj, False, "entity_not_object", type_errors
 
-    # 模型不再生成原文，由程序使用输入原文补充
+        if set(item.keys()) != {"entity", "type"}:
+            return obj, False, "wrong_entity_keys", type_errors
+
+        name = item.get("entity")
+        if not isinstance(name, str) or not name.strip():
+            return obj, False, "empty_entity", type_errors
+
+        name = name.strip()
+        typ = normalize_entity_type(item.get("type"))
+
+        if typ is None:
+            type_errors += 1
+            continue
+
+        if name not in original_text:
+            return obj, False, "entity_not_in_text", type_errors
+
+        valid_entities.append({
+            "entity": name,
+            "type": typ
+        })
+
     normalized_obj = {
         "text": original_text,
-        "entities": entities,
+        "entities": valid_entities
     }
 
-    return normalized_obj, True, None
+    return normalized_obj, True, None, type_errors
 
 def calculate_metrics(records):
     tp = fp = fn = 0
     evaluated = 0
     valid_formats = 0
+    total_type_errors = 0
+    invalid_type_samples = 0
 
     for record in records:
         if record.get("status") != "response":
@@ -114,18 +142,23 @@ def calculate_metrics(records):
         evaluated += 1
         gold = {
             (e["entity"], e["type"])
-            for e in record["gold_entities"]
+            for e in record.get("gold_entities", [])
+        }
+
+        # 只要模型成功返回响应，已通过实体级校验的预测就参与评估
+        pred = {
+            (e["entity"], e["type"])
+            for e in record.get("predicted_entities", [])
         }
 
         if record.get("format_valid"):
             valid_formats += 1
-            pred = {
-                (e["entity"], e["type"])
-                for e in record["predicted_entities"]
-            }
-        else:
-            # 模型有响应但格式无效：按空预测计入端到端实体指标
-            pred = set()
+
+        type_errors = record.get("type_errors", 0)
+        total_type_errors += type_errors
+
+        if type_errors > 0:
+            invalid_type_samples += 1
 
         tp += len(gold & pred)
         fp += len(pred - gold)
@@ -141,9 +174,18 @@ def calculate_metrics(records):
     return {
         "samples_total": len(records),
         "samples_with_response": evaluated,
-        "api_errors": sum(r.get("status") == "api_error" for r in records),
+        "api_errors": sum(
+            r.get("status") == "api_error" for r in records
+        ),
+        "processing_errors": sum(
+            r.get("status") == "processing_error" for r in records
+        ),
         "format_valid_samples": valid_formats,
-        "format_valid_rate": valid_formats / evaluated if evaluated else 0.0,
+        "format_valid_rate": (
+            valid_formats / evaluated if evaluated else 0.0
+        ),
+        "total_type_errors": total_type_errors,
+        "invalid_type_samples": invalid_type_samples,
         "TP": tp,
         "FP": fp,
         "FN": fn,
@@ -230,19 +272,62 @@ def main():
                 gold = normalize_entities(sample.get("entities", []))
                 example_count = STRATEGIES[strategy]
 
+                # 1. 构造提示词：失败属于程序处理错误
                 try:
                     messages = build_messages(
                         text=sample["text"],
                         examples=examples,
                         strategy=strategy,
                     )
-                    result = call_llm(messages)
-                    parsed, valid, error = parse_response(
-                        result["content"], sample["text"]
+                except Exception as exc:
+                    error_record = {
+                        "sample_index": idx,
+                        "pmid": sample.get("pmid"),
+                        "strategy": strategy,
+                        "status": "processing_error",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                    fout.write(
+                        json.dumps(error_record, ensure_ascii=False) + "\n"
                     )
+                    fout.flush()
+                    records_by_index[idx] = error_record
+                    print(f"[{strategy}] 提示词处理失败：{exc}")
+                    if args.delay > 0:
+                        time.sleep(args.delay)
+                    continue
+
+                # 2. 调用模型：只有这里的异常才属于 API 错误
+                try:
+                    result = call_llm(messages)
+                except Exception as exc:
+                    error_record = {
+                        "sample_index": idx,
+                        "pmid": sample.get("pmid"),
+                        "strategy": strategy,
+                        "status": "api_error",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                    fout.write(
+                        json.dumps(error_record, ensure_ascii=False) + "\n"
+                    )
+                    fout.flush()
+                    records_by_index[idx] = error_record
+                    print(f"[{strategy}] API 请求失败：{exc}")
+                    if args.delay > 0:
+                        time.sleep(args.delay)
+                    continue
+
+                # 3. 解析响应：类型错误只跳过对应实体
+                try:
+                    parsed, valid, error, type_errors = parse_response(
+                        result.get("content", ""), sample["text"]
+                    )
+
                     pred = (
-                        normalize_entities(parsed["entities"])
-                        if valid else set()
+                        normalize_entities(parsed.get("entities", []))
+                        if isinstance(parsed, dict)
+                        else set()
                     )
 
                     record = {
@@ -265,27 +350,30 @@ def main():
                         "raw_response": result.get("content", ""),
                         "format_valid": valid,
                         "format_error": error,
+                        "type_errors": type_errors,
                         "usage": result.get("usage"),
                     }
 
-                    fout.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    fout.write(
+                        json.dumps(record, ensure_ascii=False) + "\n"
+                    )
                     fout.flush()
                     records_by_index[idx] = record
 
                     print(
                         f"[{strategy}] {idx + 1}/{len(samples)} "
                         f"PMID={sample.get('pmid')} "
-                        f"format_valid={valid}"
+                        f"format_valid={valid} "
+                        f"type_errors={type_errors} "
+                        f"valid_entities={len(pred)}"
                     )
 
                 except Exception as exc:
-                    # 记录错误，但不把它当成有效模型预测；
-                    # 下次运行会自动重试这个样本。
                     error_record = {
                         "sample_index": idx,
                         "pmid": sample.get("pmid"),
                         "strategy": strategy,
-                        "status": "api_error",
+                        "status": "processing_error",
                         "error": f"{type(exc).__name__}: {exc}",
                     }
                     fout.write(
@@ -293,10 +381,7 @@ def main():
                     )
                     fout.flush()
                     records_by_index[idx] = error_record
-                    print(
-                        f"[{strategy}] {idx + 1}/{len(samples)} 请求失败："
-                        f"{type(exc).__name__}: {exc}"
-                    )
+                    print(f"[{strategy}] 响应处理失败：{exc}")
 
                 if args.delay > 0:
                     time.sleep(args.delay)
@@ -324,8 +409,8 @@ def main():
         print(json.dumps(metrics, ensure_ascii=False, indent=2))
 
     print("\n本次指定策略运行结束。")
-    print(f"预测文件目录：{OUT_DIR}")
-    print(f"指标文件目录：{REPORT_DIR}")
+    print(f"预测文件目录：{output_dir}")
+    print(f"指标文件目录：{report_dir}")
 
 
 if __name__ == "__main__":

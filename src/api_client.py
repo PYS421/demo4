@@ -1,5 +1,3 @@
-"""统一的本地 Ollama API 调用接口，兼容原有评估代码。"""
-
 import os
 from pathlib import Path
 

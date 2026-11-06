@@ -23,7 +23,22 @@ def read_jsonl(path):
         return [json.loads(line) for line in f if line.strip()]
 
 
+def normalize_entity_type(value):
+    """将实体类型规范化为 Chemical 或 Disease。"""
+    if isinstance(value, list):
+        if len(value) != 1:
+            return None
+        value = value[0]
+
+    if not isinstance(value, str):
+        return None
+
+    value = value.strip()
+    return value if value in VALID_TYPES else None
+
+
 def normalize_entities(items):
+    """保留合法实体，按 (entity, type) 去重。"""
     result = set()
 
     if not isinstance(items, list):
@@ -34,22 +49,18 @@ def normalize_entities(items):
             continue
 
         name = item.get("entity")
-        typ = item.get("type")
+        typ = normalize_entity_type(item.get("type"))
 
-        if (
-            isinstance(name, str)
-            and name.strip()
-            and typ in VALID_TYPES
-        ):
+        if isinstance(name, str) and name.strip() and typ is not None:
             result.add((name.strip(), typ))
 
     return result
 
 
 def parse_response(content, original_text):
+    """解析模型响应；单个实体类型错误不影响其他合法实体。"""
     raw = (content or "").strip()
 
-    # 兼容 Markdown JSON 代码围栏
     raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.I)
     raw = re.sub(r"\s*```$", "", raw)
 
@@ -60,48 +71,61 @@ def parse_response(content, original_text):
             from json_repair import repair_json
             obj = repair_json(raw, return_objects=True)
         except Exception:
-            return None, False, "invalid_json"
+            return None, False, "invalid_json", 0
 
     if not isinstance(obj, dict):
-        return obj, False, "not_object"
+        return obj, False, "not_object", 0
 
     if set(obj.keys()) != {"entities"}:
-        return obj, False, "wrong_top_level_keys"
+        return obj, False, "wrong_top_level_keys", 0
 
     entities = obj.get("entities")
-
     if not isinstance(entities, list):
-        return obj, False, "entities_not_list"
+        return obj, False, "entities_not_list", 0
+
+    valid_entities = []
+    type_errors = 0
 
     for item in entities:
         if not isinstance(item, dict):
-            return obj, False, "entity_not_object"
+            return obj, False, "entity_not_object", type_errors
 
         if set(item.keys()) != {"entity", "type"}:
-            return obj, False, "wrong_entity_keys"
+            return obj, False, "wrong_entity_keys", type_errors
 
         name = item.get("entity")
-        typ = item.get("type")
-
         if not isinstance(name, str) or not name.strip():
-            return obj, False, "empty_entity"
+            return obj, False, "empty_entity", type_errors
 
-        if typ not in VALID_TYPES:
-            return obj, False, "invalid_entity_type"
+        name = name.strip()
+        typ = normalize_entity_type(item.get("type"))
+
+        if typ is None:
+            type_errors += 1
+            continue
 
         if name not in original_text:
-            return obj, False, "entity_not_in_text"
+            return obj, False, "entity_not_in_text", type_errors
 
-    return {
+        valid_entities.append({
+            "entity": name,
+            "type": typ
+        })
+
+    normalized_obj = {
         "text": original_text,
-        "entities": entities,
-    }, True, None
+        "entities": valid_entities
+    }
+
+    return normalized_obj, True, None, type_errors
 
 
 def calculate_metrics(records):
     tp = fp = fn = 0
     evaluated = 0
     valid_formats = 0
+    total_type_errors = 0
+    invalid_type_samples = 0
 
     for record in records:
         if record.get("status") != "response":
@@ -111,17 +135,22 @@ def calculate_metrics(records):
 
         gold = {
             (e["entity"], e["type"])
-            for e in record["gold_entities"]
+            for e in record.get("gold_entities", [])
+        }
+
+        pred = {
+            (e["entity"], e["type"])
+            for e in record.get("predicted_entities", [])
         }
 
         if record.get("format_valid"):
             valid_formats += 1
-            pred = {
-                (e["entity"], e["type"])
-                for e in record["predicted_entities"]
-            }
-        else:
-            pred = set()
+
+        type_errors = record.get("type_errors", 0)
+        total_type_errors += type_errors
+
+        if type_errors > 0:
+            invalid_type_samples += 1
 
         tp += len(gold & pred)
         fp += len(pred - gold)
@@ -140,10 +169,15 @@ def calculate_metrics(records):
         "api_errors": sum(
             r.get("status") == "api_error" for r in records
         ),
+        "processing_errors": sum(
+            r.get("status") == "processing_error" for r in records
+        ),
         "format_valid_samples": valid_formats,
         "format_valid_rate": (
             valid_formats / evaluated if evaluated else 0.0
         ),
+        "total_type_errors": total_type_errors,
+        "invalid_type_samples": invalid_type_samples,
         "TP": tp,
         "FP": fp,
         "FN": fn,
@@ -263,55 +297,72 @@ def main():
                         examples=examples,
                         strategy=strategy,
                     )
-
-                    result = call_llm(messages)
-
-                    parsed, valid, error = parse_response(
-                        result.get("content", ""),
-                        sample["text"],
-                    )
-
-                    pred = (
-                        normalize_entities(parsed["entities"])
-                        if valid else set()
-                    )
-
-                    record = {
-                        "sample_index": idx,
-                        "pmid": sample.get("pmid"),
-                        "strategy": strategy,
-                        "shots": 2,
-                        "status": "response",
-                        "requested_model": result.get(
-                            "requested_model"
-                        ),
-                        "actual_model": result.get(
-                            "actual_model"
-                        ),
-                        "text": sample["text"],
-                        "gold_entities": [
-                            {"entity": n, "type": t}
-                            for n, t in sorted(gold)
-                        ],
-                        "predicted_entities": [
-                            {"entity": n, "type": t}
-                            for n, t in sorted(pred)
-                        ],
-                        "raw_response": result.get("content", ""),
-                        "format_valid": valid,
-                        "format_error": error,
-                        "usage": result.get("usage"),
-                    }
-
                 except Exception as exc:
                     record = {
                         "sample_index": idx,
                         "pmid": sample.get("pmid"),
                         "strategy": strategy,
                         "shots": 2,
-                        "status": "api_error",
+                        "status": "processing_error",
                         "error": f"{type(exc).__name__}: {exc}",
                     }
+                else:
+                    try:
+                        result = call_llm(messages)
+                    except Exception as exc:
+                        record = {
+                            "sample_index": idx,
+                            "pmid": sample.get("pmid"),
+                            "strategy": strategy,
+                            "shots": 2,
+                            "status": "api_error",
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                    else:
+                        try:
+                            parsed, valid, error, type_errors = parse_response(
+                                result.get("content", ""),
+                                sample["text"],
+                            )
+
+                            pred = (
+                                normalize_entities(parsed.get("entities", []))
+                                if isinstance(parsed, dict)
+                                else set()
+                            )
+
+                            record = {
+                                "sample_index": idx,
+                                "pmid": sample.get("pmid"),
+                                "strategy": strategy,
+                                "shots": 2,
+                                "status": "response",
+                                "requested_model": result.get("requested_model"),
+                                "actual_model": result.get("actual_model"),
+                                "text": sample["text"],
+                                "gold_entities": [
+                                    {"entity": n, "type": t}
+                                    for n, t in sorted(gold)
+                                ],
+                                "predicted_entities": [
+                                    {"entity": n, "type": t}
+                                    for n, t in sorted(pred)
+                                ],
+                                "raw_response": result.get("content", ""),
+                                "format_valid": valid,
+                                "format_error": error,
+                                "type_errors": type_errors,
+                                "usage": result.get("usage"),
+                            }
+                        except Exception as exc:
+                            record = {
+                                "sample_index": idx,
+                                "pmid": sample.get("pmid"),
+                                "strategy": strategy,
+                                "shots": 2,
+                                "status": "processing_error",
+                                "error": f"{type(exc).__name__}: {exc}",
+                            }
 
                 fout.write(
                     json.dumps(record, ensure_ascii=False) + "\n"
@@ -324,12 +375,14 @@ def main():
                     print(
                         f"[{strategy}] {idx + 1}/{len(samples)} "
                         f"PMID={sample.get('pmid')} "
-                        f"format_valid={record['format_valid']}"
+                        f"format_valid={record['format_valid']} "
+                        f"type_errors={record.get('type_errors', 0)} "
+                        f"valid_entities={len(record['predicted_entities'])}"
                     )
                 else:
                     print(
                         f"[{strategy}] {idx + 1}/{len(samples)} "
-                        f"请求失败：{record['error']}"
+                        f"{record['status']}：{record['error']}"
                     )
 
                 if args.delay > 0:
