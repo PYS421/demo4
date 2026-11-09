@@ -8,7 +8,7 @@ STRATEGIES = ["T0", "T1", "T2", "T3", "T4"]
 COMMON_EXAMPLE_INDICES = [0, 1]
 
 # T2 使用另一组候选示例
-T2_EXAMPLE_INDICES = [1, 2]
+T2_EXAMPLE_INDICES = [0, 1]
 
 
 PROMPTS = {

@@ -41,14 +41,15 @@ conda/
 .DS_Store
 Thumbs.db
 
-# Raw BC5CDR corpus: do not upload original dataset files
-data/*
-!data/processed/
+# Dataset files: do not upload raw or processed data
+data/
 
-# Keep only the two official experiment result directories
+# Keep only the latest official experiment results
 outputs/*
-!outputs/experiment1_500/
-!outputs/experiment2_500_rerun/
+!outputs/experiment1_500_entity_filter/
+!outputs/experiment1_500_entity_filter/**
+!outputs/experiment2_500_controlled_examples/
+!outputs/experiment2_500_controlled_examples/**
 
 # Temporary notebooks and Python backups
 .ipynb_checkpoints/

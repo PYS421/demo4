@@ -105,7 +105,7 @@ def parse_response(content, original_text):
             continue
 
         if name not in original_text:
-            return obj, False, "entity_not_in_text", type_errors
+            continue
 
         valid_entities.append({
             "entity": name,
@@ -327,7 +327,7 @@ def main():
 
                             pred = (
                                 normalize_entities(parsed.get("entities", []))
-                                if isinstance(parsed, dict)
+                                if valid and isinstance(parsed, dict)
                                 else set()
                             )
 
