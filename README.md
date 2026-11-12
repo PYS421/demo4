@@ -190,12 +190,7 @@ $$
 
 模型输出满足预期结构化格式要求的样本比例。
 
-$$
-\text{Format Validity Rate}
-=
-\frac{\text{格式有效的样本数}}
-{\text{总样本数}}
-$$
+$\text{Format Validity Rate}=\frac{\text{格式有效的样本数}}{\text{总样本数}}$
 
 ### 6.5 TP、FP、FN
 
